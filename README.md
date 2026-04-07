@@ -223,6 +223,13 @@ Thanks to all the people who have contributed to this project! 🎉
                 </a>
             </td>
             <td align="center">
+                <a href="https://github.com/hail100">
+                    <img src="https://avatars.githubusercontent.com/u/7278395?v=4" width="100;" alt="hail100"/>
+                    <br />
+                    <sub><b>hail100</b></sub>
+                </a>
+            </td>
+            <td align="center">
                 <a href="https://github.com/vyomshm">
                     <img src="https://avatars.githubusercontent.com/u/20184946?v=4" width="100;" alt="vyomshm"/>
                     <br />
@@ -236,13 +243,6 @@ Thanks to all the people who have contributed to this project! 🎉
                     <sub><b>tpkeeper</b></sub>
                 </a>
             </td>
-            <td align="center">
-                <a href="https://github.com/hail100">
-                    <img src="https://avatars.githubusercontent.com/u/7278395?v=4" width="100;" alt="hail100"/>
-                    <br />
-                    <sub><b>hail100</b></sub>
-                </a>
-            </td>
 		</tr>
 		<tr>
             <td align="center">
@@ -253,10 +253,24 @@ Thanks to all the people who have contributed to this project! 🎉
                 </a>
             </td>
             <td align="center">
+                <a href="https://github.com/daatsuka">
+                    <img src="https://avatars.githubusercontent.com/u/92530585?v=4" width="100;" alt="daatsuka"/>
+                    <br />
+                    <sub><b>daatsuka</b></sub>
+                </a>
+            </td>
+            <td align="center">
                 <a href="https://github.com/corverroos">
                     <img src="https://avatars.githubusercontent.com/u/29249923?v=4" width="100;" alt="corverroos"/>
                     <br />
                     <sub><b>corver</b></sub>
+                </a>
+            </td>
+            <td align="center">
+                <a href="https://github.com/boyi">
+                    <img src="https://avatars.githubusercontent.com/u/1566932?v=4" width="100;" alt="boyi"/>
+                    <br />
+                    <sub><b>boyi</b></sub>
                 </a>
             </td>
             <td align="center">
@@ -273,6 +287,8 @@ Thanks to all the people who have contributed to this project! 🎉
                     <sub><b>Vaiz_07</b></sub>
                 </a>
             </td>
+		</tr>
+		<tr>
             <td align="center">
                 <a href="https://github.com/freeeverett">
                     <img src="https://avatars.githubusercontent.com/u/54989739?v=4" width="100;" alt="freeeverett"/>
