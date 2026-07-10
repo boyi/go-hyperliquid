@@ -94,6 +94,15 @@ func ExchangeOptNonceFunc(f NonceFunc) ExchangeOpt {
 	}
 }
 
+// ExchangeOptPreSubmit injects a hook run just before each L1 action's nonce is
+// allocated. Use it to do the waiting — rate limiting, admission control — on
+// the near side of the nonce. See PreSubmitFunc.
+func ExchangeOptPreSubmit(f PreSubmitFunc) ExchangeOpt {
+	return func(e *Exchange) {
+		e.preSubmit = f
+	}
+}
+
 // ExchangeOptL1Signer injects an L1ActionSigner. When nil, the default ECDSA implementation with privateKey is used.
 func ExchangeOptL1Signer(s L1ActionSigner) ExchangeOpt {
 	return func(e *Exchange) {

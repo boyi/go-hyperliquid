@@ -22,6 +22,18 @@ import (
 // collision without any coordination between the Exchange values.
 type NonceFunc func() int64
 
+// PreSubmitFunc runs immediately before an action's nonce is allocated. It may
+// block — to acquire a rate-limit token, say — and returns the context carried
+// through signing and the HTTP request, so it can hand a reservation downstream.
+// A non-nil error aborts the submit before any nonce is consumed.
+//
+// The ordering is the point. Hyperliquid accepts a nonce only if it is greater
+// than the smallest of the 100 most recent nonces it remembers for that signer.
+// A nonce allocated *before* a queueing delay can fall out of that window while
+// it waits and come back "Invalid nonce: nonce too low". Blocking here instead
+// keeps the nonce younger than the wait.
+type PreSubmitFunc func(context.Context) (context.Context, error)
+
 type Exchange struct {
 	debug        bool
 	client       *client
@@ -33,6 +45,7 @@ type Exchange struct {
 	expiresAfter *int64
 	lastNonce    atomic.Int64
 	nonceFunc    NonceFunc
+	preSubmit    PreSubmitFunc
 
 	l1Signer         L1ActionSigner
 	userSignedSigner UserSignedActionSigner
@@ -169,6 +182,14 @@ func (e *Exchange) signAgent(
 
 // signAndPost signs an L1 action and posts it, returning the raw response body.
 func (e *Exchange) signAndPost(ctx context.Context, action any) ([]byte, error) {
+	// Runs before the nonce is allocated, never after — see PreSubmitFunc.
+	if e.preSubmit != nil {
+		var err error
+		if ctx, err = e.preSubmit(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	nonce := e.nextNonce()
 
 	sig, err := e.signL1Action(
