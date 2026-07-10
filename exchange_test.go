@@ -2,6 +2,7 @@ package hyperliquid
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,6 +142,68 @@ func TestNextNonce_ConcurrencyUniqueness(t *testing.T) {
 		}
 		if max != base+N-1 {
 			t.Fatalf("max=%d want %d", max, base+N-1)
+		}
+	})
+}
+
+// TestNextNonce_SameKeyExchangesCollide pins the collision that ExchangeOptNonceFunc
+// exists to fix: lastNonce is per-Exchange, so two Exchange values signing with the
+// same key hand out the same wall-clock millisecond and Hyperliquid rejects the
+// second submit with "Invalid nonce: duplicate nonce".
+func TestNextNonce_SameKeyExchangesCollide(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var e1, e2 Exchange
+
+		if a, b := e1.nextNonce(), e2.nextNonce(); a != b {
+			t.Fatalf("expected independent Exchanges to collide, got %d and %d", a, b)
+		}
+	})
+}
+
+// TestNextNonce_InjectedNonceFuncIsShared shows the fix: one allocator behind both
+// Exchange values yields a single collision-free sequence, and the built-in
+// lastNonce is left untouched.
+func TestNextNonce_InjectedNonceFuncIsShared(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var counter atomic.Int64
+		counter.Store(time.Now().UnixMilli())
+		shared := func() int64 { return counter.Add(1) }
+
+		var e1, e2 Exchange
+		ExchangeOptNonceFunc(shared)(&e1)
+		ExchangeOptNonceFunc(shared)(&e2)
+
+		const N = 500
+		results := make([]int64, 0, 2*N)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for _, e := range []*Exchange{&e1, &e2} {
+			for i := 0; i < N; i++ {
+				wg.Add(1)
+				go func(e *Exchange) {
+					defer wg.Done()
+					n := e.nextNonce()
+					mu.Lock()
+					results = append(results, n)
+					mu.Unlock()
+				}(e)
+			}
+		}
+		wg.Wait()
+
+		seen := make(map[int64]struct{}, len(results))
+		for _, v := range results {
+			if _, dup := seen[v]; dup {
+				t.Fatalf("duplicate nonce %d across Exchanges sharing a NonceFunc", v)
+			}
+			seen[v] = struct{}{}
+		}
+		if len(seen) != 2*N {
+			t.Fatalf("got %d unique nonces, want %d", len(seen), 2*N)
+		}
+		// The injected source fully replaces the built-in allocator.
+		if got := e1.lastNonce.Load(); got != 0 {
+			t.Fatalf("lastNonce mutated despite injected NonceFunc: %d", got)
 		}
 	})
 }

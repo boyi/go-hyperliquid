@@ -10,6 +10,18 @@ import (
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 )
 
+// NonceFunc allocates the nonce for an action. It must never return a value
+// twice for a given signer address, and must stay inside Hyperliquid's
+// (T - 2 days, T + 1 day) window — see nextNonce.
+//
+// Injecting one matters when several Exchange values sign with the SAME key
+// (e.g. one per builder dex, or per scoped client). Each Exchange owns a
+// separate lastNonce, so two of them can independently pick the same wall-clock
+// millisecond and the second submit is rejected with "Invalid nonce: duplicate
+// nonce". A NonceFunc backed by one allocator per signer address removes that
+// collision without any coordination between the Exchange values.
+type NonceFunc func() int64
+
 type Exchange struct {
 	debug        bool
 	client       *client
@@ -20,6 +32,7 @@ type Exchange struct {
 	info         *Info
 	expiresAfter *int64
 	lastNonce    atomic.Int64
+	nonceFunc    NonceFunc
 
 	l1Signer         L1ActionSigner
 	userSignedSigner UserSignedActionSigner
@@ -63,7 +76,14 @@ func NewExchange(
 // nextNonce returns either the current timestamp in milliseconds or incremented by one to prevent duplicates
 // Nonces must be within (T - 2 days, T + 1 day), where T is the unix millisecond timestamp on the block of the transaction.
 // See https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/nonces-and-api-wallets#hyperliquid-nonces
+//
+// The built-in allocator below is unique only within this Exchange. When several
+// Exchange values share a signing key, inject a shared allocator with
+// ExchangeOptNonceFunc; lastNonce is then unused.
 func (e *Exchange) nextNonce() int64 {
+	if e.nonceFunc != nil {
+		return e.nonceFunc()
+	}
 	// it's possible that at exactly the same time a nextNonce is requested
 	for {
 		last := e.lastNonce.Load()

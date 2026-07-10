@@ -85,6 +85,15 @@ func InfoOptPerpDexName(dex string) InfoOpt {
 	}
 }
 
+// ExchangeOptNonceFunc injects the nonce allocator. When nil, each Exchange
+// allocates from its own lastNonce, which collides across Exchange values that
+// share a signing key. See NonceFunc.
+func ExchangeOptNonceFunc(f NonceFunc) ExchangeOpt {
+	return func(e *Exchange) {
+		e.nonceFunc = f
+	}
+}
+
 // ExchangeOptL1Signer injects an L1ActionSigner. When nil, the default ECDSA implementation with privateKey is used.
 func ExchangeOptL1Signer(s L1ActionSigner) ExchangeOpt {
 	return func(e *Exchange) {
