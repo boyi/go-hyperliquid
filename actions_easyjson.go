@@ -3048,10 +3048,8 @@ func easyjsonB97b45a3DecodeGithubComSoniricoGoHyperliquid29(in *jlexer.Lexer, ou
 				in.Delim(']')
 			}
 		case "grouping":
-			if in.IsNull() {
-				in.Skip()
-			} else {
-				out.Grouping = string(in.String())
+			if data := in.Raw(); in.Ok() {
+				in.AddError((out.Grouping).UnmarshalJSON(data))
 			}
 		case "builder":
 			if in.IsNull() {
@@ -3110,7 +3108,7 @@ func easyjsonB97b45a3EncodeGithubComSoniricoGoHyperliquid29(out *jwriter.Writer,
 	{
 		const prefix string = ",\"grouping\":"
 		out.RawString(prefix)
-		out.String(string(in.Grouping))
+		out.Raw((in.Grouping).MarshalJSON())
 	}
 	if in.Builder != nil {
 		const prefix string = ",\"builder\":"

@@ -80,7 +80,12 @@ func newCreateOrderAction(
 	e *Exchange,
 	orders []CreateOrderRequest,
 	info *BuilderInfo,
+	grouping OrderGrouping,
 ) (OrderAction, error) {
+	if err := grouping.Validate(); err != nil {
+		return OrderAction{}, err
+	}
+
 	orderRequests := make([]OrderWire, len(orders))
 	for i, order := range orders {
 		priceWire, err := floatToWire(order.Price)
@@ -120,7 +125,7 @@ func newCreateOrderAction(
 	res := OrderAction{
 		Type:     "order",
 		Orders:   orderRequests,
-		Grouping: string(GroupingNA),
+		Grouping: grouping,
 		Builder:  info,
 	}
 
@@ -132,7 +137,18 @@ func (e *Exchange) Order(
 	req CreateOrderRequest,
 	builder *BuilderInfo,
 ) (result OrderStatus, err error) {
-	resp, err := e.BulkOrders(ctx, []CreateOrderRequest{req}, builder)
+	return e.OrderGrouped(ctx, req, builder, OrderGrouping{})
+}
+
+// OrderGrouped is Order with an explicit grouping, e.g. a PriorityGrouping that
+// bids for execution priority. The zero OrderGrouping is what Order sends.
+func (e *Exchange) OrderGrouped(
+	ctx context.Context,
+	req CreateOrderRequest,
+	builder *BuilderInfo,
+	grouping OrderGrouping,
+) (result OrderStatus, err error) {
+	resp, err := e.BulkOrdersGrouped(ctx, []CreateOrderRequest{req}, builder, grouping)
 	if err != nil {
 		return
 	}
@@ -156,7 +172,20 @@ func (e *Exchange) BulkOrders(
 	orders []CreateOrderRequest,
 	builder *BuilderInfo,
 ) (result *APIResponse[OrderResponse], err error) {
-	action, err := newCreateOrderAction(e, orders, builder)
+	return e.BulkOrdersGrouped(ctx, orders, builder, OrderGrouping{})
+}
+
+// BulkOrdersGrouped is BulkOrders with an explicit grouping, e.g. a
+// PriorityGrouping that bids for execution priority. The grouping applies to
+// the batch as a whole: HyperCore only accepts a priority grouping when every
+// order in it is IOC, or every order is a non-reduce-only ALO.
+func (e *Exchange) BulkOrdersGrouped(
+	ctx context.Context,
+	orders []CreateOrderRequest,
+	builder *BuilderInfo,
+	grouping OrderGrouping,
+) (result *APIResponse[OrderResponse], err error) {
+	action, err := newCreateOrderAction(e, orders, builder, grouping)
 	if err != nil {
 		return nil, err
 	}

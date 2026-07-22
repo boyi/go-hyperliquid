@@ -150,11 +150,11 @@ type OrderWireTypeTrigger struct {
 // OrderAction represents the order action with deterministic field ordering
 // CRITICAL: Field order MUST match Python SDK insertion order for msgpack hash consistency
 type OrderAction struct {
-	Type     string       `json:"type"              msgpack:"type"`
-	Dex      string       `json:"dex,omitempty"     msgpack:"dex,omitempty"`
-	Orders   []OrderWire  `json:"orders"            msgpack:"orders"`
-	Grouping string       `json:"grouping"          msgpack:"grouping"`
-	Builder  *BuilderInfo `json:"builder,omitempty" msgpack:"builder,omitempty"`
+	Type     string        `json:"type"              msgpack:"type"`
+	Dex      string        `json:"dex,omitempty"     msgpack:"dex,omitempty"`
+	Orders   []OrderWire   `json:"orders"            msgpack:"orders"`
+	Grouping OrderGrouping `json:"grouping"          msgpack:"grouping"`
+	Builder  *BuilderInfo  `json:"builder,omitempty" msgpack:"builder,omitempty"`
 }
 
 // ModifyAction represents a single order modification
