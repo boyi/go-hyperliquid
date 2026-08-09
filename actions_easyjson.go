@@ -3048,8 +3048,12 @@ func easyjsonB97b45a3DecodeGithubComSoniricoGoHyperliquid29(in *jlexer.Lexer, ou
 				in.Delim(']')
 			}
 		case "grouping":
-			if data := in.Raw(); in.Ok() {
-				in.AddError((out.Grouping).UnmarshalJSON(data))
+			if in.IsNull() {
+				in.Skip()
+			} else {
+				if data := in.Raw(); in.Ok() {
+					in.AddError((out.Grouping).UnmarshalJSON(data))
+				}
 			}
 		case "builder":
 			if in.IsNull() {
@@ -4000,6 +4004,12 @@ func easyjsonB97b45a3DecodeGithubComSoniricoGoHyperliquid38(in *jlexer.Lexer, ou
 				}
 				in.Delim(']')
 			}
+		case "f":
+			if in.IsNull() {
+				in.Skip()
+			} else {
+				out.Fast = bool(in.Bool())
+			}
 		default:
 			in.SkipRecursive()
 		}
@@ -4039,6 +4049,11 @@ func easyjsonB97b45a3EncodeGithubComSoniricoGoHyperliquid38(out *jwriter.Writer,
 			}
 			out.RawByte(']')
 		}
+	}
+	if in.Fast {
+		const prefix string = ",\"f\":"
+		out.RawString(prefix)
+		out.Bool(bool(in.Fast))
 	}
 	out.RawByte('}')
 }
@@ -4119,6 +4134,12 @@ func easyjsonB97b45a3DecodeGithubComSoniricoGoHyperliquid39(in *jlexer.Lexer, ou
 				}
 				in.Delim(']')
 			}
+		case "f":
+			if in.IsNull() {
+				in.Skip()
+			} else {
+				out.Fast = bool(in.Bool())
+			}
 		default:
 			in.SkipRecursive()
 		}
@@ -4158,6 +4179,11 @@ func easyjsonB97b45a3EncodeGithubComSoniricoGoHyperliquid39(out *jwriter.Writer,
 			}
 			out.RawByte(']')
 		}
+	}
+	if in.Fast {
+		const prefix string = ",\"f\":"
+		out.RawString(prefix)
+		out.Bool(bool(in.Fast))
 	}
 	out.RawByte('}')
 }

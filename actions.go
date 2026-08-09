@@ -16,6 +16,10 @@ type CancelAction struct {
 	Type    string            `json:"type"          msgpack:"type"`
 	Dex     string            `json:"dex,omitempty" msgpack:"dex,omitempty"`
 	Cancels []CancelOrderWire `json:"cancels"       msgpack:"cancels"`
+	// Fast is HyperCore's `f` flag. It MUST stay last (the action hash is taken
+	// over this exact field order) and MUST carry omitempty: the exchange rejects
+	// actions hashed with an explicit `f: false`.
+	Fast bool `json:"f,omitempty" msgpack:"f,omitempty"`
 }
 
 // CancelByCloidWire represents cancel by cloid item wire format
@@ -32,6 +36,8 @@ type CancelByCloidAction struct {
 	Type    string              `json:"type"          msgpack:"type"`
 	Dex     string              `json:"dex,omitempty" msgpack:"dex,omitempty"`
 	Cancels []CancelByCloidWire `json:"cancels"       msgpack:"cancels"`
+	// See CancelAction.Fast — same flag, same placement and omitempty rules.
+	Fast bool `json:"f,omitempty" msgpack:"f,omitempty"`
 }
 
 // UsdClassTransferAction represents USD class transfer
