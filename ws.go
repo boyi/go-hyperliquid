@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,8 +37,11 @@ type Subscription struct {
 }
 
 type WebsocketClient struct {
-	url                   string
-	conn                  *websocket.Conn
+	url  string
+	conn *websocket.Conn
+	// writeConn mirrors conn for writeJSON, which runs both with and without
+	// mu held and therefore cannot take mu to read conn.
+	writeConn             atomic.Pointer[websocket.Conn]
 	dialer                *websocket.Dialer
 	mu                    sync.RWMutex
 	writeMu               sync.Mutex
@@ -50,6 +54,11 @@ type WebsocketClient struct {
 	readTimeout           time.Duration
 	debug                 bool
 	logger                lol.Logger
+	// logf receives connection-lifecycle events and errors (see WsOptLogf).
+	// Unlike debug mode it never sees per-message market data.
+	logf func(format string, args ...any)
+	// reconnectAttempt counts consecutive failed reconnects, for logging only.
+	reconnectAttempt atomic.Int64
 }
 
 var upstreamHosts map[string]struct{}
@@ -130,6 +139,22 @@ func NewWebsocketClient(baseURL string, opts ...WsOpt) *WebsocketClient {
 		},
 	}
 
+	// Subscription acks and server-side errors are rare, so they are logged
+	// verbatim: they are the only way to tell "connection alive but this
+	// subscription was rejected/dropped" apart from a dead connection.
+	cli.msgDispatcherRegistry[ChannelSubResponse] = msgDispatcherFunc[any](
+		func(_ []*uniqSubscriber, msg wsMessage) error {
+			cli.logInfof("subscription response: %s", string(msg.Data))
+			return nil
+		},
+	)
+	cli.msgDispatcherRegistry[ChannelError] = msgDispatcherFunc[any](
+		func(_ []*uniqSubscriber, msg wsMessage) error {
+			cli.logErrf("server error message: %s", string(msg.Data))
+			return nil
+		},
+	)
+
 	for _, opt := range opts {
 		opt.Apply(cli)
 	}
@@ -156,11 +181,18 @@ func (w *WebsocketClient) Connect(ctx context.Context) error {
 	}
 
 	w.conn = conn
+	w.writeConn.Store(conn)
+	desc := connDesc(w.url, conn)
+	w.logInfof("websocket connected %s subscriptions=%d", desc, len(w.subscribers))
 
-	go w.readPump(ctx)
+	go w.readPump(ctx, desc)
 	go w.pingPump(ctx)
 
-	return w.resubscribeAll()
+	return w.resubscribeAll(desc)
+}
+
+func connDesc(u string, conn *websocket.Conn) string {
+	return fmt.Sprintf("url=%s local=%s remote=%s", u, conn.LocalAddr(), conn.RemoteAddr())
 }
 
 type Handler[T subscriptable] func(wsMessage) (T, error)
@@ -184,7 +216,7 @@ func (w *WebsocketClient) subscribe(
 			// on subscribe
 			func(p subscriptable) {
 				if err := w.sendSubscribe(p); err != nil {
-					w.logErrf("failed to subscribe: %v", err)
+					w.logErrf("failed to subscribe key=%s: %v", pkey, err)
 				}
 			},
 			// on unsubscribe
@@ -193,7 +225,7 @@ func (w *WebsocketClient) subscribe(
 				defer w.mu.Unlock()
 				delete(w.subscribers, pkey)
 				if err := w.sendUnsubscribe(p); err != nil {
-					w.logErrf("failed to unsubscribe: %v", err)
+					w.logErrf("failed to unsubscribe key=%s: %v", pkey, err)
 				}
 			},
 		)
@@ -225,6 +257,7 @@ func (w *WebsocketClient) Close() error {
 
 func (w *WebsocketClient) close() error {
 	close(w.done)
+	w.logInfof("websocket client closed url=%s", w.url)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -241,13 +274,14 @@ func (w *WebsocketClient) close() error {
 
 // Private methods
 
-func (w *WebsocketClient) readPump(ctx context.Context) {
+func (w *WebsocketClient) readPump(ctx context.Context, desc string) {
 	shouldReconnect := false
 	defer func() {
 		w.mu.Lock()
 		if w.conn != nil {
 			_ = w.conn.Close() // Ignore close error in defer
 			w.conn = nil
+			w.writeConn.Store(nil)
 		}
 		w.mu.Unlock()
 
@@ -259,12 +293,15 @@ func (w *WebsocketClient) readPump(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			w.logInfof("websocket read pump stopped (context done) %s", desc)
 			return
 		case <-w.done:
+			w.logInfof("websocket read pump stopped (client closed) %s", desc)
 			return
 		default:
 			if err := w.conn.SetReadDeadline(time.Now().Add(w.readTimeout)); err != nil {
-				w.logErrf("websocket set read deadline: %v", err)
+				w.logErrf("websocket set read deadline %s: %v "+
+					"(disconnected; ping pump will reconnect)", desc, err)
 				return
 			}
 
@@ -272,13 +309,21 @@ func (w *WebsocketClient) readPump(ctx context.Context) {
 			if err != nil {
 				var netErr net.Error
 				if errors.As(err, &netErr) && netErr.Timeout() {
-					w.logErrf("websocket read timeout, reconnecting")
+					w.logErrf("websocket read timeout after %s %s, reconnecting now",
+						w.readTimeout, desc)
 					shouldReconnect = true
 					return
 				}
-				if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-					w.logErrf("websocket read error: %v", err)
+				select {
+				case <-w.done:
+					w.logInfof("websocket read pump stopped (client closed) %s: %v", desc, err)
+					return
+				default:
 				}
+				// No immediate reconnect on this path: the connection is dropped
+				// and the next ping (up to pingInterval later) triggers it.
+				w.logErrf("websocket read error %s: %v "+
+					"(disconnected; ping pump will reconnect within %s)", desc, err, pingInterval)
 				return
 			}
 
@@ -310,13 +355,22 @@ func (w *WebsocketClient) pingPump(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := w.sendPing(); err != nil {
-				w.logErrf("ping error: %v", err)
-				w.reconnect(ctx)
+			if !w.pingOnce(ctx) {
 				return
 			}
 		}
 	}
+}
+
+// pingOnce sends one ping. On failure it reconnects (which starts a new ping
+// pump) and returns false so the caller's pump stops.
+func (w *WebsocketClient) pingOnce(ctx context.Context) bool {
+	if err := w.sendPing(); err != nil {
+		w.logErrf("ping error url=%s: %v, reconnecting", w.url, err)
+		w.reconnect(ctx)
+		return false
+	}
+	return true
 }
 
 func (w *WebsocketClient) dispatch(msg wsMessage) error {
@@ -340,9 +394,15 @@ func (w *WebsocketClient) reconnect(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			if err := w.Connect(ctx); err == nil {
+			attempt := w.reconnectAttempt.Add(1)
+			err := w.Connect(ctx)
+			if err == nil {
+				w.reconnectAttempt.Store(0)
+				w.logInfof("websocket reconnect attempt %d succeeded url=%s", attempt, w.url)
 				return
 			}
+			w.logErrf("websocket reconnect attempt %d failed url=%s: %v, retrying in %s",
+				attempt, w.url, err, w.reconnectWait)
 			time.Sleep(w.reconnectWait)
 			w.reconnectWait *= 2 // TODO: configurable strategies such as exponential backoff and the like
 			if w.reconnectWait > time.Minute {
@@ -352,11 +412,31 @@ func (w *WebsocketClient) reconnect(ctx context.Context) {
 	}
 }
 
-func (w *WebsocketClient) resubscribeAll() error {
-	for _, subscriber := range w.subscribers {
+// resubscribeAll re-sends every active subscription on a fresh connection.
+// It returns on the first failure, as before. The log line lists the keys
+// that were never re-sent: a failure here leaves the connection up (a
+// retried Connect is a no-op), so those subscriptions stay silent until the
+// next reconnect.
+func (w *WebsocketClient) resubscribeAll(desc string) error {
+	total := len(w.subscribers)
+	sent := make(map[string]struct{}, total)
+	for key, subscriber := range w.subscribers {
 		if err := w.sendSubscribe(subscriber.subscriptionPayload); err != nil {
+			var missing []string
+			for k := range w.subscribers {
+				if _, ok := sent[k]; !ok {
+					missing = append(missing, k)
+				}
+			}
+			sort.Strings(missing)
+			w.logErrf("resubscribe failed %s at key=%s after %d/%d sent: %v; not re-sent: %v",
+				desc, key, len(sent), total, err, missing)
 			return fmt.Errorf("resubscribe: %w", err)
 		}
+		sent[key] = struct{}{}
+	}
+	if total > 0 {
+		w.logInfof("resubscribed %d/%d subscriptions %s", len(sent), total, desc)
 	}
 	return nil
 }
@@ -383,7 +463,8 @@ func (w *WebsocketClient) writeJSON(v any) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 
-	if w.conn == nil {
+	conn := w.writeConn.Load()
+	if conn == nil {
 		return fmt.Errorf("connection closed")
 	}
 
@@ -392,15 +473,25 @@ func (w *WebsocketClient) writeJSON(v any) error {
 		w.logDebugf("[>] %s", string(bts))
 	}
 
-	return w.conn.WriteJSON(v)
+	return conn.WriteJSON(v)
 }
 
-func (w *WebsocketClient) logErrf(fmt string, args ...any) {
-	if w.logger == nil {
-		return
+func (w *WebsocketClient) logErrf(format string, args ...any) {
+	if w.logger != nil {
+		w.logger.Errorf(format, args...)
 	}
+	if w.logf != nil {
+		w.logf("[hl-ws][error] "+format, args...)
+	}
+}
 
-	w.logger.Errorf(fmt, args...)
+func (w *WebsocketClient) logInfof(format string, args ...any) {
+	if w.logger != nil {
+		w.logger.Infof(format, args...)
+	}
+	if w.logf != nil {
+		w.logf("[hl-ws] "+format, args...)
+	}
 }
 
 func (w *WebsocketClient) logDebugf(fmt string, args ...any) {

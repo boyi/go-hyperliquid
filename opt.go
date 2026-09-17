@@ -141,6 +141,18 @@ func WsOptReadTimeout(timeout time.Duration) WsOpt {
 	}
 }
 
+// WsOptLogf routes connection-lifecycle events (connect, disconnect, read
+// timeout/error, reconnect attempts, resubscribe results), subscribe and
+// unsubscribe send failures, server "error" messages and subscription acks to
+// f. Unlike WsOptDebugMode it does not log market-data messages, so the log
+// volume scales with events, not with traffic. It can be combined with a
+// debug logger; both receive these events.
+func WsOptLogf(f func(format string, args ...any)) WsOpt {
+	return func(w *WebsocketClient) {
+		w.logf = f
+	}
+}
+
 // WsOptDialer allows setting a custom websocket.Dialer
 func WsOptDialer(dialer *websocket.Dialer) WsOpt {
 	return func(w *WebsocketClient) {
