@@ -23,6 +23,9 @@ const (
 	ChannelOpenOrders         string = "openOrders"
 	ChannelTwapStates         string = "twapStates"
 	ChannelWebData3           string = "webData3"
+	// ChannelError carries server-side rejections, e.g. an invalid or
+	// over-limit subscription.
+	ChannelError string = "error"
 )
 
 type wsMessage struct {
