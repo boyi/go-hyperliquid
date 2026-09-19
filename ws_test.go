@@ -186,3 +186,44 @@ func TestWsNoLoggerIsSilent(t *testing.T) {
 		require.NoError(t, client.dispatch(wsMessage{Channel: ch, Data: json.RawMessage(`"x"`)}))
 	}
 }
+
+// TestConnectionGenerationCountsReconnects pins the contract brick's fill-coverage
+// proof rests on: the counter starts at zero, the first dial makes it one, and each
+// internal reconnect — which subscribers are never told about — bumps it again.
+func TestConnectionGenerationCountsReconnects(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(*http.Request) bool { return true },
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				_ = conn.Close()
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	client := NewWebsocketClient(server.URL, WsOptReadTimeout(200*time.Millisecond))
+	require.Equal(t, uint64(0), client.ConnectionGeneration(), "no dial yet")
+
+	require.NoError(t, client.Connect(ctx))
+	require.Equal(t, uint64(1), client.ConnectionGeneration(), "first connection")
+
+	// A second Connect on a live client is a no-op and must not count.
+	require.NoError(t, client.Connect(ctx))
+	require.Equal(t, uint64(1), client.ConnectionGeneration(), "no-op Connect")
+
+	// The read timeout fires and the client reconnects on its own.
+	require.Eventually(t, func() bool { return client.ConnectionGeneration() > 1 },
+		2*time.Second, 20*time.Millisecond, "internal reconnect should bump the generation")
+
+	require.NoError(t, client.Close())
+}

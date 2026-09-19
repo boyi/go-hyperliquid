@@ -59,6 +59,9 @@ type WebsocketClient struct {
 	logf func(format string, args ...any)
 	// reconnectAttempt counts consecutive failed reconnects, for logging only.
 	reconnectAttempt atomic.Int64
+	// connGeneration counts established connections, so callers can detect that
+	// the connection underneath them was replaced. See ConnectionGeneration.
+	connGeneration atomic.Uint64
 }
 
 var upstreamHosts map[string]struct{}
@@ -182,13 +185,26 @@ func (w *WebsocketClient) Connect(ctx context.Context) error {
 
 	w.conn = conn
 	w.writeConn.Store(conn)
+	generation := w.connGeneration.Add(1)
 	desc := connDesc(w.url, conn)
-	w.logInfof("websocket connected %s subscriptions=%d", desc, len(w.subscribers))
+	w.logInfof("websocket connected %s subscriptions=%d generation=%d", desc, len(w.subscribers), generation)
 
 	go w.readPump(ctx, desc)
 	go w.pingPump(ctx)
 
 	return w.resubscribeAll(desc)
+}
+
+// ConnectionGeneration reports how many connections this client has established:
+// it starts at 0 and increments on every successful dial, the internal reconnects
+// included. Subscribers are never told that a reconnect happened — readPump logs
+// the failure and dials again underneath them — so recording this value and
+// comparing it later is the only way a caller can tell whether the stream it is
+// reasoning about ran on one unbroken connection. A caller that must not miss
+// messages (an account stream feeding local state, say) can treat a changed
+// generation as "resubscribed, so there may be a gap".
+func (w *WebsocketClient) ConnectionGeneration() uint64 {
+	return w.connGeneration.Load()
 }
 
 func connDesc(u string, conn *websocket.Conn) string {
