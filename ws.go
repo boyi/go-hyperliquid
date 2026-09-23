@@ -28,6 +28,15 @@ const (
 	// the server before treating the connection as stalled. Must exceed pingInterval
 	// so that normal pong responses do not trigger a false timeout.
 	wsReadTimeout = 90 * time.Second
+
+	// baseReconnectWait is the first backoff step, both for failed dials and for
+	// connections that drop almost as soon as they are established.
+	baseReconnectWait = time.Second
+
+	// minStableConnLifetime separates "the server rotated a connection" (reconnect
+	// immediately) from "the server keeps dropping us right after the upgrade"
+	// (back off, or we would hammer it in a tight loop).
+	minStableConnLifetime = time.Second
 )
 
 type Subscription struct {
@@ -59,6 +68,10 @@ type WebsocketClient struct {
 	logf func(format string, args ...any)
 	// reconnectAttempt counts consecutive failed reconnects, for logging only.
 	reconnectAttempt atomic.Int64
+	// minStableLifetime is minStableConnLifetime; a field only so tests can shrink it.
+	minStableLifetime time.Duration
+	// pingPumps counts running ping pumps; there must never be more than one.
+	pingPumps atomic.Int32
 }
 
 var upstreamHosts map[string]struct{}
@@ -112,11 +125,12 @@ func NewWebsocketClient(baseURL string, opts ...WsOpt) *WebsocketClient {
 	wsURL := parsedURL.String()
 
 	cli := &WebsocketClient{
-		url:           wsURL,
-		done:          make(chan struct{}),
-		reconnectWait: time.Second,
-		readTimeout:   wsReadTimeout,
-		subscribers:   make(map[string]*uniqSubscriber),
+		url:               wsURL,
+		done:              make(chan struct{}),
+		reconnectWait:     baseReconnectWait,
+		minStableLifetime: minStableConnLifetime,
+		readTimeout:       wsReadTimeout,
+		subscribers:       make(map[string]*uniqSubscriber),
 		msgDispatcherRegistry: map[string]msgDispatcher{
 			ChannelPong:           NewPongDispatcher(),
 			ChannelTrades:         NewMsgDispatcher[Trades](ChannelTrades),
@@ -185,8 +199,12 @@ func (w *WebsocketClient) Connect(ctx context.Context) error {
 	desc := connDesc(w.url, conn)
 	w.logInfof("websocket connected %s subscriptions=%d", desc, len(w.subscribers))
 
-	go w.readPump(ctx, desc)
-	go w.pingPump(ctx)
+	// Both pumps are bound to this one connection. The read pump owns its
+	// teardown and the reconnect; connDone tells this connection's ping pump to
+	// stop, so pumps never outlive their connection or pile up across reconnects.
+	connDone := make(chan struct{})
+	go w.readPump(ctx, conn, desc, connDone, time.Now())
+	go w.pingPump(ctx, conn, connDone)
 
 	return w.resubscribeAll(desc)
 }
@@ -274,20 +292,38 @@ func (w *WebsocketClient) close() error {
 
 // Private methods
 
-func (w *WebsocketClient) readPump(ctx context.Context, desc string) {
+func (w *WebsocketClient) readPump(
+	ctx context.Context,
+	conn *websocket.Conn,
+	desc string,
+	connDone chan struct{},
+	connectedAt time.Time,
+) {
 	shouldReconnect := false
 	defer func() {
+		close(connDone)
+
 		w.mu.Lock()
-		if w.conn != nil {
-			_ = w.conn.Close() // Ignore close error in defer
+		_ = conn.Close() // Ignore close error in defer
+		// Only clear the client's connection if it is still ours.
+		if w.conn == conn {
 			w.conn = nil
 			w.writeConn.Store(nil)
 		}
 		w.mu.Unlock()
 
-		if shouldReconnect {
-			w.reconnect(ctx)
+		if !shouldReconnect {
+			return
 		}
+		if time.Since(connectedAt) < w.minStableLifetime {
+			// Dropped right after the upgrade: back off instead of looping.
+			if !w.sleepReconnectWait(ctx) {
+				return
+			}
+		} else {
+			w.reconnectWait = baseReconnectWait
+		}
+		w.reconnect(ctx)
 	}()
 
 	for {
@@ -299,13 +335,13 @@ func (w *WebsocketClient) readPump(ctx context.Context, desc string) {
 			w.logInfof("websocket read pump stopped (client closed) %s", desc)
 			return
 		default:
-			if err := w.conn.SetReadDeadline(time.Now().Add(w.readTimeout)); err != nil {
-				w.logErrf("websocket set read deadline %s: %v "+
-					"(disconnected; ping pump will reconnect)", desc, err)
+			if err := conn.SetReadDeadline(time.Now().Add(w.readTimeout)); err != nil {
+				w.logErrf("websocket set read deadline %s: %v, reconnecting now", desc, err)
+				shouldReconnect = true
 				return
 			}
 
-			_, msg, err := w.conn.ReadMessage()
+			_, msg, err := conn.ReadMessage()
 			if err != nil {
 				var netErr net.Error
 				if errors.As(err, &netErr) && netErr.Timeout() {
@@ -320,10 +356,12 @@ func (w *WebsocketClient) readPump(ctx context.Context, desc string) {
 					return
 				default:
 				}
-				// No immediate reconnect on this path: the connection is dropped
-				// and the next ping (up to pingInterval later) triggers it.
-				w.logErrf("websocket read error %s: %v "+
-					"(disconnected; ping pump will reconnect within %s)", desc, err, pingInterval)
+				// Server closes (e.g. Hyperliquid's periodic `close 1000 (normal):
+				// Expired`) and resets land here. Reconnect now: waiting for the
+				// next ping left the connection dead for up to pingInterval
+				// (measured 2026-09-23: p50 22s, max 49s per close).
+				w.logErrf("websocket read error %s: %v, reconnecting now", desc, err)
+				shouldReconnect = true
 				return
 			}
 
@@ -344,7 +382,29 @@ func (w *WebsocketClient) readPump(ctx context.Context, desc string) {
 	}
 }
 
-func (w *WebsocketClient) pingPump(ctx context.Context) {
+// sleepReconnectWait waits the current backoff step, then doubles it (capped at
+// a minute). It returns false if the client or context ended while waiting.
+func (w *WebsocketClient) sleepReconnectWait(ctx context.Context) bool {
+	wait := w.reconnectWait
+	w.reconnectWait *= 2
+	if w.reconnectWait > time.Minute {
+		w.reconnectWait = time.Minute
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-w.done:
+		return false
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (w *WebsocketClient) pingPump(ctx context.Context, conn *websocket.Conn, connDone chan struct{}) {
+	w.pingPumps.Add(1)
+	defer w.pingPumps.Add(-1)
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 
@@ -354,20 +414,24 @@ func (w *WebsocketClient) pingPump(ctx context.Context) {
 			return
 		case <-ctx.Done():
 			return
+		case <-connDone:
+			return
 		case <-ticker.C:
-			if !w.pingOnce(ctx) {
+			if !w.pingOnce(conn) {
 				return
 			}
 		}
 	}
 }
 
-// pingOnce sends one ping. On failure it reconnects (which starts a new ping
-// pump) and returns false so the caller's pump stops.
-func (w *WebsocketClient) pingOnce(ctx context.Context) bool {
+// pingOnce sends one ping. On failure it closes this pump's connection, which
+// makes that connection's read pump fail and reconnect, and returns false so
+// the ping pump stops. It never reconnects itself: the read pump is the single
+// owner of reconnects, so two pumps can never race to rebuild the connection.
+func (w *WebsocketClient) pingOnce(conn *websocket.Conn) bool {
 	if err := w.sendPing(); err != nil {
-		w.logErrf("ping error url=%s: %v, reconnecting", w.url, err)
-		w.reconnect(ctx)
+		w.logErrf("ping error url=%s: %v, closing connection so the read pump reconnects", w.url, err)
+		_ = conn.Close()
 		return false
 	}
 	return true
@@ -403,10 +467,8 @@ func (w *WebsocketClient) reconnect(ctx context.Context) {
 			}
 			w.logErrf("websocket reconnect attempt %d failed url=%s: %v, retrying in %s",
 				attempt, w.url, err, w.reconnectWait)
-			time.Sleep(w.reconnectWait)
-			w.reconnectWait *= 2 // TODO: configurable strategies such as exponential backoff and the like
-			if w.reconnectWait > time.Minute {
-				w.reconnectWait = time.Minute
+			if !w.sleepReconnectWait(ctx) {
+				return
 			}
 		}
 	}
