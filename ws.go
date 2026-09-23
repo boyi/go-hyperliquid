@@ -429,7 +429,9 @@ func (w *WebsocketClient) pingPump(ctx context.Context, conn *websocket.Conn, co
 // the ping pump stops. It never reconnects itself: the read pump is the single
 // owner of reconnects, so two pumps can never race to rebuild the connection.
 func (w *WebsocketClient) pingOnce(conn *websocket.Conn) bool {
-	if err := w.sendPing(); err != nil {
+	// Ping the pump's own connection, not the client's current one: a stale pump
+	// racing a reconnect must never ping (or, on failure, misjudge) the replacement.
+	if err := w.writeJSONTo(conn, wsCommand{Method: "ping"}); err != nil {
 		w.logErrf("ping error url=%s: %v, closing connection so the read pump reconnects", w.url, err)
 		_ = conn.Close()
 		return false
@@ -517,15 +519,16 @@ func (w *WebsocketClient) sendUnsubscribe(payload subscriptable) error {
 	})
 }
 
-func (w *WebsocketClient) sendPing() error {
-	return w.writeJSON(wsCommand{Method: "ping"})
+func (w *WebsocketClient) writeJSON(v any) error {
+	return w.writeJSONTo(w.writeConn.Load(), v)
 }
 
-func (w *WebsocketClient) writeJSON(v any) error {
+// writeJSONTo writes to a specific connection, serialized with every other
+// write (gorilla allows only one concurrent writer).
+func (w *WebsocketClient) writeJSONTo(conn *websocket.Conn, v any) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 
-	conn := w.writeConn.Load()
 	if conn == nil {
 		return fmt.Errorf("connection closed")
 	}

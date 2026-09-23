@@ -270,3 +270,32 @@ func TestFlappingServerBacksOff(t *testing.T) {
 	// Backoff 1s then 2s: at most the initial connect plus one retry in 1.5s.
 	require.LessOrEqual(t, connects.Load(), int32(2))
 }
+
+// TestStalePingPumpNeverTouchesTheReplacement: a ping from a pump whose
+// connection was already replaced must go to (and fail on) its own connection,
+// leaving the new connection alone.
+func TestStalePingPumpNeverTouchesTheReplacement(t *testing.T) {
+	var connects atomic.Int32
+	server := expiringServer(t, time.Hour, &connects)
+	defer server.Close()
+
+	client := NewWebsocketClient(server.URL)
+	client.minStableLifetime = 0
+	require.NoError(t, client.Connect(context.Background()))
+	defer client.Close()
+
+	old := client.writeConn.Load()
+	require.NotNil(t, old)
+	_ = old.Close() // read pump sees the error and reconnects
+	require.Eventually(t, func() bool {
+		cur := client.writeConn.Load()
+		return connects.Load() == 2 && cur != nil && cur != old
+	}, 3*time.Second, 10*time.Millisecond)
+	cur := client.writeConn.Load()
+
+	require.False(t, client.pingOnce(old), "a stale pump's ping must fail on its own closed connection")
+	require.Same(t, cur, client.writeConn.Load(), "the replacement must stay installed")
+	require.True(t, client.pingOnce(cur), "the replacement must still be usable")
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, int32(2), connects.Load(), "no extra reconnect")
+}
