@@ -111,7 +111,7 @@ func (r *logRecorder) dump() string {
 
 // TestWsOptLogfLifecycle checks that, without debug mode, WsOptLogf sees the
 // subscription ack, a server error message, a server-side disconnect, and the
-// ping-driven reconnect with its resubscribe, and never sees market data.
+// reconnect with its resubscribe, and never sees market data.
 func TestWsOptLogfLifecycle(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var connectCount atomic.Int32
@@ -151,6 +151,8 @@ func TestWsOptLogfLifecycle(t *testing.T) {
 
 	rec := &logRecorder{}
 	client := NewWebsocketClient(server.URL, WsOptLogf(rec.logf))
+	// The first connection is dropped right after serving; don't back off.
+	client.minStableLifetime = 0
 	require.NoError(t, client.Connect(context.Background()))
 	defer client.Close()
 
@@ -168,9 +170,8 @@ func TestWsOptLogfLifecycle(t *testing.T) {
 	require.False(t, rec.has(`"px"`), "market data must not be logged:\n"+rec.dump())
 	require.GreaterOrEqual(t, bboCount.Load(), int32(1))
 
-	// Reconnect is driven by the ping pump; trigger it directly instead of
-	// waiting for pingInterval.
-	require.False(t, client.pingOnce(context.Background()), "ping on a dropped connection must fail and reconnect")
+	// The read pump reconnects on its own as soon as the server drops it; no
+	// ping is needed.
 	require.Eventually(t, func() bool {
 		return rec.has("websocket reconnect attempt 1 succeeded") &&
 			rec.has("resubscribed 1/1 subscriptions")
@@ -185,4 +186,116 @@ func TestWsNoLoggerIsSilent(t *testing.T) {
 	for _, ch := range []string{ChannelSubResponse, ChannelError} {
 		require.NoError(t, client.dispatch(wsMessage{Channel: ch, Data: json.RawMessage(`"x"`)}))
 	}
+}
+
+// expiringServer closes every connection with the frame Hyperliquid sends when
+// it rotates connections (`close 1000 (normal): Expired`) after `lifetime`.
+func expiringServer(t *testing.T, lifetime time.Duration, connects *atomic.Int32) *httptest.Server {
+	t.Helper()
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		connects.Add(1)
+		defer conn.Close()
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		time.Sleep(lifetime)
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Expired"),
+			time.Now().Add(time.Second))
+		time.Sleep(50 * time.Millisecond)
+	}))
+}
+
+// TestReadPumpReconnectsImmediatelyOnServerClose: a server close must be
+// followed by a reconnect right away, not after the next ping (pingInterval).
+func TestReadPumpReconnectsImmediatelyOnServerClose(t *testing.T) {
+	var connects atomic.Int32
+	server := expiringServer(t, 1200*time.Millisecond, &connects)
+	defer server.Close()
+
+	rec := &logRecorder{}
+	client := NewWebsocketClient(server.URL, WsOptLogf(rec.logf))
+	require.NoError(t, client.Connect(context.Background()))
+	defer client.Close()
+
+	start := time.Now()
+	require.Eventually(t, func() bool { return connects.Load() >= 2 },
+		3*time.Second, 10*time.Millisecond, rec.dump())
+	require.Less(t, time.Since(start), 2*time.Second, "reconnect must not wait for a ping")
+	require.True(t, rec.has("Expired, reconnecting now"), rec.dump())
+	require.True(t, rec.has("websocket reconnect attempt 1 succeeded"), rec.dump())
+}
+
+// TestPingPumpsDoNotAccumulate: each connection gets exactly one ping pump and
+// it stops with its connection, however many reconnects happen.
+func TestPingPumpsDoNotAccumulate(t *testing.T) {
+	var connects atomic.Int32
+	server := expiringServer(t, 50*time.Millisecond, &connects)
+	defer server.Close()
+
+	client := NewWebsocketClient(server.URL)
+	client.minStableLifetime = 0
+	require.NoError(t, client.Connect(context.Background()))
+
+	require.Eventually(t, func() bool { return connects.Load() >= 5 },
+		3*time.Second, 10*time.Millisecond)
+	require.LessOrEqual(t, client.pingPumps.Load(), int32(1))
+
+	require.NoError(t, client.Close())
+	require.Eventually(t, func() bool { return client.pingPumps.Load() == 0 },
+		time.Second, 10*time.Millisecond, "ping pump must stop with the client")
+}
+
+// TestFlappingServerBacksOff: a server that drops every connection right after
+// the upgrade must not be hammered in a tight loop.
+func TestFlappingServerBacksOff(t *testing.T) {
+	var connects atomic.Int32
+	server := expiringServer(t, 0, &connects)
+	defer server.Close()
+
+	client := NewWebsocketClient(server.URL)
+	require.NoError(t, client.Connect(context.Background()))
+	defer client.Close()
+
+	time.Sleep(1500 * time.Millisecond)
+	// Backoff 1s then 2s: at most the initial connect plus one retry in 1.5s.
+	require.LessOrEqual(t, connects.Load(), int32(2))
+}
+
+// TestStalePingPumpNeverTouchesTheReplacement: a ping from a pump whose
+// connection was already replaced must go to (and fail on) its own connection,
+// leaving the new connection alone.
+func TestStalePingPumpNeverTouchesTheReplacement(t *testing.T) {
+	var connects atomic.Int32
+	server := expiringServer(t, time.Hour, &connects)
+	defer server.Close()
+
+	client := NewWebsocketClient(server.URL)
+	client.minStableLifetime = 0
+	require.NoError(t, client.Connect(context.Background()))
+	defer client.Close()
+
+	old := client.writeConn.Load()
+	require.NotNil(t, old)
+	_ = old.Close() // read pump sees the error and reconnects
+	require.Eventually(t, func() bool {
+		cur := client.writeConn.Load()
+		return connects.Load() == 2 && cur != nil && cur != old
+	}, 3*time.Second, 10*time.Millisecond)
+	cur := client.writeConn.Load()
+
+	require.False(t, client.pingOnce(old), "a stale pump's ping must fail on its own closed connection")
+	require.Same(t, cur, client.writeConn.Load(), "the replacement must stay installed")
+	require.True(t, client.pingOnce(cur), "the replacement must still be usable")
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, int32(2), connects.Load(), "no extra reconnect")
 }
